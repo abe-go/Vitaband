@@ -1,0 +1,401 @@
+#include <SPI.h>
+#include <LoRa.h>
+
+// ==================================================
+// VITABAND - ESP32 BASE STATION
+// LoRa + Continuous SOS Buzzer + ACK Button
+// ==================================================
+
+// ---------------- LORA PINS ----------------
+#define LORA_SCK   18
+#define LORA_MISO  19
+#define LORA_MOSI  23
+#define LORA_SS     5
+#define LORA_RST   14
+#define LORA_DIO0  26
+
+// ---------------- BASE STATION PINS ----------------
+#define BUZZER_PIN 25
+#define ACK_BUTTON 27
+
+// ---------------- LORA CONFIGURATION ----------------
+#define LORA_FREQUENCY 433E6
+#define LORA_SYNC_WORD 0x12
+
+// ---------------- ACK CONFIGURATION ----------------
+const unsigned long ACK_INTERVAL = 500;
+const unsigned long BUTTON_DEBOUNCE = 50;
+
+// ---------------- SOS STATE ----------------
+bool emergencyActive = false;
+bool emergencyAcknowledged = false;
+
+String emergencyDevice = "VB01";
+String emergencyGPS = "NO FIX";
+String emergencyLatitude = "N/A";
+String emergencyLongitude = "N/A";
+
+unsigned long lastSOSMillis = 0;
+unsigned long lastAckMillis = 0;
+unsigned long lastButtonMillis = 0;
+
+// ---------------- BUZZER STATE ----------------
+bool buzzerActive = false;
+bool buzzerState = false;
+unsigned long buzzerMillis = 0;
+
+const unsigned long BUZZER_INTERVAL = 250;
+
+// ==================================================
+// START BUZZER
+// ==================================================
+void startSOSBeep() {
+  if (buzzerActive) return;
+
+  buzzerActive = true;
+  buzzerState = true;
+  buzzerMillis = millis();
+
+  digitalWrite(BUZZER_PIN, HIGH);
+}
+
+// ==================================================
+// STOP BUZZER
+// ==================================================
+void stopSOSBeep() {
+  buzzerActive = false;
+  buzzerState = false;
+
+  digitalWrite(BUZZER_PIN, LOW);
+}
+
+// ==================================================
+// CONTINUOUS BUZZER WITHOUT BLOCKING LORA
+// ==================================================
+void updateBuzzer() {
+  if (!buzzerActive) return;
+
+  if (millis() - buzzerMillis >= BUZZER_INTERVAL) {
+    buzzerMillis = millis();
+    buzzerState = !buzzerState;
+
+    digitalWrite(
+      BUZZER_PIN,
+      buzzerState ? HIGH : LOW
+    );
+  }
+}
+
+// ==================================================
+// SPLIT PACKET BY |
+// ==================================================
+int splitPacket(String packet, String fields[], int maxFields) {
+  int count = 0;
+  int start = 0;
+
+  while (count < maxFields) {
+    int separator = packet.indexOf('|', start);
+
+    if (separator == -1) {
+      fields[count++] = packet.substring(start);
+      break;
+    }
+
+    fields[count++] = packet.substring(start, separator);
+    start = separator + 1;
+  }
+
+  return count;
+}
+
+// ==================================================
+// HANDLE NORMAL SENSOR DATA
+// Expected:
+// DATA|VB01|BPM|FINGER|ACTIVITY|ACCEL|GPS|LAT|LON|SAT|PACKET
+// ==================================================
+void handleDataPacket(String packet) {
+  String fields[12];
+  int count = splitPacket(packet, fields, 12);
+
+  if (count < 11) {
+    Serial.println("[WARNING] Invalid DATA packet.");
+    Serial.println(packet);
+    return;
+  }
+
+  Serial.println();
+  Serial.println("========== VITABAND DATA ==========");
+
+  Serial.print("Device ID:       ");
+  Serial.println(fields[1]);
+
+  Serial.print("Heart Rate:      ");
+
+  if (fields[3] == "1" ||
+      fields[3] == "YES" ||
+      fields[3] == "true" ||
+      fields[3] == "TRUE") {
+    Serial.print(fields[2]);
+    Serial.println(" BPM");
+  } else {
+    Serial.println("No finger detected");
+  }
+
+  Serial.print("Finger Detected: ");
+  Serial.println(fields[3]);
+
+  Serial.print("Activity:        ");
+  Serial.println(fields[4]);
+
+  Serial.print("Acceleration:    ");
+  Serial.println(fields[5]);
+
+  Serial.print("GPS Status:      ");
+  Serial.println(fields[6]);
+
+  Serial.print("Latitude:        ");
+  Serial.println(fields[7]);
+
+  Serial.print("Longitude:       ");
+  Serial.println(fields[8]);
+
+  Serial.print("GPS Satellites:  ");
+  Serial.println(fields[9]);
+
+  Serial.print("Packet Number:   ");
+  Serial.println(fields[10]);
+
+  Serial.println("===================================");
+}
+
+// ==================================================
+// HANDLE SOS EMERGENCY
+// Expected:
+// SOS|VB01|GPS_FIX|LATITUDE|LONGITUDE
+// ==================================================
+void handleSOS(String packet) {
+  String fields[8];
+  int count = splitPacket(packet, fields, 8);
+
+  if (count < 5) {
+    Serial.println("[WARNING] Invalid SOS packet.");
+    Serial.println(packet);
+    return;
+  }
+
+  bool newEmergency = !emergencyActive;
+
+  emergencyDevice = fields[1];
+  emergencyGPS = fields[2];
+  emergencyLatitude = fields[3];
+  emergencyLongitude = fields[4];
+
+  lastSOSMillis = millis();
+
+  if (newEmergency) {
+    emergencyActive = true;
+    emergencyAcknowledged = false;
+
+    Serial.println();
+    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+    Serial.println("!!! SOS EMERGENCY ALERT !!!");
+    Serial.println("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+
+    Serial.print("Device ID: ");
+    Serial.println(emergencyDevice);
+
+    Serial.print("GPS Status: ");
+    Serial.println(emergencyGPS);
+
+    Serial.print("Latitude: ");
+    Serial.println(emergencyLatitude);
+
+    Serial.print("Longitude: ");
+    Serial.println(emergencyLongitude);
+
+    Serial.println("BUZZER ACTIVE - PRESS ACK BUTTON");
+    Serial.println("Waiting for acknowledgment...");
+
+    startSOSBeep();
+  } else if (!emergencyAcknowledged) {
+    Serial.print("[SOS] Updated location: ");
+    Serial.print(emergencyLatitude);
+    Serial.print(", ");
+    Serial.println(emergencyLongitude);
+  }
+}
+
+// ==================================================
+// RECEIVE LORA PACKETS
+// ==================================================
+void checkLoRa() {
+  int packetSize = LoRa.parsePacket();
+
+  if (packetSize == 0) return;
+
+  String packet = "";
+
+  while (LoRa.available()) {
+    packet += (char)LoRa.read();
+  }
+
+  Serial.print("[LoRa] Received: ");
+  Serial.println(packet);
+
+  if (packet.startsWith("DATA|")) {
+    handleDataPacket(packet);
+  } else if (packet.startsWith("SOS|")) {
+    handleSOS(packet);
+  } else {
+    Serial.println("[LoRa] Unknown packet type.");
+  }
+
+  Serial.print("[LoRa] RSSI: ");
+  Serial.print(LoRa.packetRssi());
+  Serial.println(" dBm");
+}
+
+// ==================================================
+// SEND ACK TO WEARABLE
+// ==================================================
+void sendACK() {
+  LoRa.beginPacket();
+  LoRa.print("ACK|");
+  LoRa.print(emergencyDevice);
+  LoRa.endPacket();
+
+  Serial.println("[LoRa] ACK sent to wearable.");
+}
+
+// ==================================================
+// READ AND DEBOUNCE ACK BUTTON
+// Button is connected between GPIO27 and GND.
+// ==================================================
+void updateACKButton() {
+  static int lastButtonReading = HIGH;
+  static int stableButtonState = HIGH;
+
+  int reading = digitalRead(ACK_BUTTON);
+
+  if (reading != lastButtonReading) {
+    lastButtonMillis = millis();
+    lastButtonReading = reading;
+  }
+
+  if (millis() - lastButtonMillis >= BUTTON_DEBOUNCE) {
+    if (reading != stableButtonState) {
+      stableButtonState = reading;
+
+      if (stableButtonState == LOW &&
+          emergencyActive &&
+          !emergencyAcknowledged) {
+
+        emergencyAcknowledged = true;
+
+        // Stop the buzzer immediately.
+        stopSOSBeep();
+
+        Serial.println();
+        Serial.println("========== SOS ACKNOWLEDGED ==========");
+        Serial.println("ACK BUTTON PRESSED");
+        Serial.println("BUZZER STOPPED");
+        Serial.println("Sending ACK to wearable...");
+        Serial.println("======================================");
+      }
+    }
+  }
+}
+
+// ==================================================
+// KEEP SENDING ACK UNTIL SOS TRANSMISSIONS STOP
+// ==================================================
+void updateACKTransmission() {
+  if (!emergencyActive || !emergencyAcknowledged) {
+    return;
+  }
+
+  if (millis() - lastAckMillis >= ACK_INTERVAL) {
+    lastAckMillis = millis();
+    sendACK();
+  }
+}
+
+// ==================================================
+// CLEAR ACKNOWLEDGED EMERGENCY
+// Clear only after SOS packets stop arriving.
+// ==================================================
+void updateEmergencyState() {
+  if (emergencyActive &&
+      emergencyAcknowledged &&
+      millis() - lastSOSMillis >= 5000) {
+
+    emergencyActive = false;
+    emergencyAcknowledged = false;
+
+    stopSOSBeep();
+
+    Serial.println();
+    Serial.println("[SYSTEM] Previous SOS cleared.");
+    Serial.println("[SYSTEM] Ready for a new emergency.");
+  }
+}
+
+// ==================================================
+// SETUP
+// ==================================================
+void setup() {
+  Serial.begin(115200);
+  delay(1000);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  digitalWrite(BUZZER_PIN, LOW);
+
+  pinMode(ACK_BUTTON, INPUT_PULLUP);
+
+  Serial.println();
+  Serial.println("==================================");
+  Serial.println("      VITABAND BASE STATION       ");
+  Serial.println("==================================");
+  Serial.println("Initializing LoRa...");
+
+  SPI.begin(
+    LORA_SCK,
+    LORA_MISO,
+    LORA_MOSI,
+    LORA_SS
+  );
+
+  LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
+
+  if (!LoRa.begin(LORA_FREQUENCY)) {
+    Serial.println("ERROR: LoRa initialization failed!");
+    Serial.println("Check wiring, antenna, and 3.3V power.");
+
+    while (true) {
+      digitalWrite(BUZZER_PIN, LOW);
+      delay(1000);
+    }
+  }
+
+  LoRa.setSyncWord(LORA_SYNC_WORD);
+  LoRa.setSpreadingFactor(7);
+  LoRa.setSignalBandwidth(125E3);
+  LoRa.setCodingRate4(5);
+  LoRa.enableCrc();
+
+  Serial.println("LoRa initialized successfully!");
+  Serial.println("Frequency: 433 MHz");
+  Serial.println("Waiting for wearable packets...");
+  Serial.println();
+}
+
+// ==================================================
+// MAIN LOOP
+// ==================================================
+void loop() {
+  checkLoRa();
+  updateACKButton();
+  updateACKTransmission();
+  updateBuzzer();
+  updateEmergencyState();
+}
